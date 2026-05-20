@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Car Comparator</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #f5f4f0; font-family: 'DM Sans', sans-serif; }
+    .card { background: white; border-radius: 18px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.05); border: 1px solid #ebebeb; margin-bottom: 12px; }
+    .stat-card { background: white; border-radius: 14px; padding: 16px 18px; flex: 1; border: 1px solid #ebebeb; }
+    .term-btn { border: 1.5px solid #e0e0e0; background: white; padding: 8px 0; border-radius: 8px; font-family: 'DM Mono', monospace; font-size: 12px; font-weight: 500; cursor: pointer; transition: all 0.15s; color: #555; flex: 1; }
+    .term-btn.active { background: #1a1a1a; color: white; border-color: #1a1a1a; }
+    .term-btn:hover:not(.active) { border-color: #999; color: #1a1a1a; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useCallback } = React;
+
+    // ── helpers ─────────────────────────────────────────────
+    const uid = () => Math.random().toString(36).slice(2, 9);
+
+    const calcDerived = (car) => {
+      const sellingPrice = car.msrp - car.discount;
+      const outTheDoor = sellingPrice + car.docFee + car.tax + car.tags + car.warranty;
+      const financed = Math.max(0, outTheDoor - car.downPayment);
+      const r = car.interestRate / 100 / 12;
+      const n = car.loanTerm;
+      const monthly = r === 0 ? financed / n : (financed * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1);
+      const totalCost = monthly * n + car.downPayment;
+      const totalInterest = Math.max(0, totalCost - outTheDoor);
+      return { sellingPrice, outTheDoor, financed, monthly: Math.max(0, monthly), totalCost, totalInterest };
+    };
+
+    const newCar = () => ({
+      id: uid(), title: "New Car", notes: "",
+      msrp: 0, discount: 0, docFee: 0, tax: 0, tags: 0, warranty: 0,
+      downPayment: 0, interestRate: 6.9, loanTerm: 60, _createdAt: Date.now(),
+    });
+
+    const fmtDec = (n) => n.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmt0   = (n) => n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+
+    // ── Firestore REST ──────────────────────────────────────
+    const PROJECT  = "car-purchase-c1437";
+    const API_KEY  = "AIzaSyBHiqO4FLBHg8sMKf6Uvnrug7l0P-ztEk4";
+    const BASE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
+
+    const toFV = (v) => {
+      if (v === null || v === undefined) return { nullValue: null };
+      if (typeof v === "boolean")        return { booleanValue: v };
+      if (typeof v === "number")         return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+      if (typeof v === "string")         return { stringValue: v };
+      if (Array.isArray(v))              return { arrayValue: { values: v.map(toFV) } };
+      if (typeof v === "object")         return { mapValue: { fields: Object.fromEntries(Object.entries(v).map(([k, x]) => [k, toFV(x)])) } };
+      return { stringValue: String(v) };
+    };
+
+    const fromFV = (v) => {
+      if (!v) return null;
+      if ("nullValue"    in v) return null;
+      if ("booleanValue" in v) return v.booleanValue;
+      if ("integerValue" in v) return Number(v.integerValue);
+      if ("doubleValue"  in v) return v.doubleValue;
+      if ("stringValue"  in v) return v.stringValue;
+      if ("arrayValue"   in v) return (v.arrayValue.values || []).map(fromFV);
+      if ("mapValue"     in v) return fromDoc(v.mapValue);
+      return null;
+    };
+
+    const fromDoc = (doc) => Object.fromEntries(Object.entries(doc.fields || {}).map(([k, v]) => [k, fromFV(v)]));
+    const toDoc   = (obj) => ({ fields: Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, toFV(v)])) });
+
+    async function fsGet(col) {
+      const res = await fetch(`${BASE_URL}/${col}?key=${API_KEY}`);
+      if (!res.ok) throw new Error(`GET failed: ${res.status} ${res.statusText}`);
+      const data = await res.json();
+      return (data.documents || []).map(fromDoc);
+    }
+
+    async function fsPatch(col, id, obj) {
+      const res = await fetch(`${BASE_URL}/${col}/${id}?key=${API_KEY}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(toDoc(obj)),
+      });
+      if (!res.ok) throw new Error(`PATCH failed: ${res.status} ${res.statusText}`);
+    }
+
+    async function fsDelete(col, id) {
+      const res = await fetch(`${BASE_URL}/${col}/${id}?key=${API_KEY}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`DELETE failed: ${res.status} ${res.statusText}`);
+    }
+
+    // ── EditableRow ─────────────────────────────────────────
+    function EditableRow({ label, value, onChange, isNegative = false, accent }) {
+      const [editing, setEditing] = useState(false);
+      const [raw, setRaw] = useState("");
+      const display = value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      return (
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 0", borderBottom: "1px solid #f0f0f0" }}>
+          <span style={{ fontSize: "13px", color: "#666" }}>{label}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: "2px" }}>
+            {isNegative && <span style={{ fontSize: "13px", color: "#dc2626", fontFamily: "monospace" }}>−</span>}
+            <span style={{ fontSize: "13px", color: "#aaa", fontFamily: "monospace" }}>$</span>
+            {editing ? (
+              <input autoFocus type="number" defaultValue={value}
+                onChange={(e) => setRaw(e.target.value)}
+                onBlur={() => { const v = parseFloat(raw); if (!isNaN(v) && v >= 0) onChange(v); setEditing(false); }}
+                onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); if (e.key === "Escape") setEditing(false); }}
+                style={{ width: "90px", fontFamily: "monospace", fontSize: "13px", fontWeight: 700, color: accent || "#1a1a1a", border: "none", borderBottom: `2px solid ${accent || "#2563eb"}`, outline: "none", background: "transparent", textAlign: "right", padding: "0 0 2px 0" }}
+              />
+            ) : (
+              <span onClick={() => { setRaw(String(value)); setEditing(true); }}
+                style={{ fontFamily: "monospace", fontSize: "13px", fontWeight: 700, color: accent || "#1a1a1a", cursor: "text", borderBottom: "1.5px dashed #d0d0d0", paddingBottom: "1px", minWidth: "70px", textAlign: "right", display: "inline-block" }}>
+                {display}
+              </span>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── NumberInput ─────────────────────────────────────────
+    function NumberInput({ label, value, onChange, prefix, suffix }) {
+      const [raw, setRaw] = useState(String(value));
+      const [focused, setFocused] = useState(false);
+      const commit = () => {
+        const v = parseFloat(raw);
+        if (!isNaN(v) && v >= 0) onChange(v);
+        else setRaw(String(value));
+        setFocused(false);
+      };
+      return (
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: "11px", letterSpacing: "0.1em", textTransform: "uppercase", color: "#aaa", fontWeight: 500, marginBottom: "8px" }}>{label}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px", background: "#f7f7f7", borderRadius: "10px", padding: "10px 14px", border: `1.5px solid ${focused ? "#2563eb" : "#ebebeb"}`, transition: "border 0.15s" }}>
+            {prefix && <span style={{ fontFamily: "monospace", fontSize: "15px", color: "#aaa" }}>{prefix}</span>}
+            <input type="number" value={focused ? raw : value}
+              onChange={(e) => setRaw(e.target.value)}
+              onFocus={() => { setRaw(String(value)); setFocused(true); }}
+              onBlur={commit}
+              onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+              style={{ flex: 1, border: "none", background: "transparent", fontFamily: "monospace", fontSize: "18px", fontWeight: 700, color: "#1a1a1a", outline: "none", width: "100%", minWidth: 0 }}
+            />
+            {suffix && <span style={{ fontFamily: "monospace", fontSize: "15px", color: "#aaa" }}>{suffix}</span>}
+          </div>
+        </div>
+      );
+    }
+
+    // ── ShareModal ──────────────────────────────────────────
+    function ShareModal({ car, onClose }) {
+      const [copied, setCopied] = useState(false);
+      const d = calcDerived(car);
+      const c = (n) => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const lines = [
+        `🚗 ${car.title}`,
+        car.notes ? `📝 ${car.notes}` : null, ``,
+        `Deal Breakdown`,
+        `MSRP           ${c(car.msrp)}`,
+        `Discount      -${c(car.discount)}`,
+        `Selling Price  ${c(d.sellingPrice)}`,
+        `Doc Fees       ${c(car.docFee)}`,
+        `State Tax      ${c(car.tax)}`,
+        `Tags/Reg       ${c(car.tags)}`,
+        car.warranty > 0 ? `Warranty       ${c(car.warranty)}` : null,
+        `Out-the-Door   ${c(d.outTheDoor)}`, ``,
+        `Financing`,
+        `Down Payment   ${c(car.downPayment)}`,
+        `Rate / Term    ${car.interestRate.toFixed(1)}% / ${car.loanTerm}mo`,
+        `Financed       ${c(d.financed)}`,
+        `Monthly Pmt    ${c(d.monthly)}`,
+        `Total Interest ${c(d.totalInterest)}`,
+        `Total Cost     ${c(d.totalCost)}`,
+      ].filter(l => l !== null).join("\n");
+      const copy = () => navigator.clipboard.writeText(lines).then(() => { setCopied(true); setTimeout(() => setCopied(false), 2000); });
+      return (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: "20px" }}>
+          <div style={{ background: "white", borderRadius: "20px", padding: "22px", width: "100%", maxWidth: "380px", boxShadow: "0 8px 40px rgba(0,0,0,0.2)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "14px" }}>
+              <span style={{ fontSize: "13px", fontWeight: 700, color: "#1a1a1a", textTransform: "uppercase", letterSpacing: "0.05em" }}>Share Summary</span>
+              <button onClick={onClose} style={{ background: "none", border: "none", fontSize: "20px", cursor: "pointer", color: "#999" }}>×</button>
+            </div>
+            <pre style={{ fontFamily: "monospace", fontSize: "12px", lineHeight: "1.55", color: "#333", background: "#f7f7f7", borderRadius: "12px", padding: "12px", margin: "0 0 14px 0", whiteSpace: "pre-wrap", wordBreak: "break-word", overflowY: "auto", maxHeight: "55vh" }}>{lines}</pre>
+            <button onClick={copy} style={{ width: "100%", padding: "13px", borderRadius: "12px", border: "none", background: copied ? "#16a34a" : "#1a1a1a", color: "white", fontSize: "14px", fontWeight: 600, cursor: "pointer", transition: "background 0.2s" }}>
+              {copied ? "✓ Copied!" : "Copy to Clipboard"}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── CarsList ────────────────────────────────────────────
+    function CarsList({ cars, selectedId, onSelect, onAdd, onDelete }) {
+      return (
+        <div style={{ padding: "16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+            <span style={{ fontSize: "13px", color: "#999", fontWeight: 500 }}>{cars.length} car{cars.length !== 1 ? "s" : ""}</span>
+            <button onClick={onAdd} style={{ background: "#1a1a1a", color: "white", border: "none", borderRadius: "10px", padding: "8px 16px", fontSize: "13px", fontWeight: 600, cursor: "pointer" }}>+ Add Car</button>
+          </div>
+          {cars.length === 0 && (
+            <div style={{ textAlign: "center", padding: "60px 20px", color: "#bbb" }}>
+              <div style={{ fontSize: "40px", marginBottom: "12px" }}>🚗</div>
+              <div style={{ fontSize: "14px" }}>No cars yet. Tap <strong>+ Add Car</strong> to get started.</div>
+            </div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {cars.map(car => {
+              const d = calcDerived(car);
+              const sel = car.id === selectedId;
+              return (
+                <div key={car.id} onClick={() => onSelect(car.id)}
+                  style={{ background: "white", borderRadius: "16px", padding: "16px 18px", border: `2px solid ${sel ? "#2563eb" : "#ebebeb"}`, cursor: "pointer", transition: "all 0.15s", boxShadow: sel ? "0 0 0 3px rgba(37,99,235,0.1)" : "0 1px 6px rgba(0,0,0,0.05)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                    <div style={{ flex: 1, minWidth: 0, marginRight: "12px" }}>
+                      <div style={{ fontSize: "15px", fontWeight: 700, color: "#1a1a1a", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{car.title || "Untitled"}</div>
+                      {car.notes && <div style={{ fontSize: "12px", color: "#888", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginTop: "2px" }}>{car.notes}</div>}
+                      <div style={{ display: "flex", gap: "16px", marginTop: "10px" }}>
+                        <div>
+                          <div style={{ fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.08em", color: "#bbb", fontWeight: 500 }}>Monthly</div>
+                          <div style={{ fontSize: "18px", fontWeight: 700, fontFamily: "monospace", color: "#1a1a1a" }}>{fmtDec(d.monthly)}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.08em", color: "#bbb", fontWeight: 500 }}>Out-the-Door</div>
+                          <div style={{ fontSize: "18px", fontWeight: 700, fontFamily: "monospace", color: "#555" }}>{fmt0(d.outTheDoor)}</div>
+                        </div>
+                      </div>
+                    </div>
+                    <button onClick={(e) => { e.stopPropagation(); onDelete(car.id); }}
+                      style={{ background: "#fee2e2", border: "none", borderRadius: "8px", width: "30px", height: "30px", cursor: "pointer", color: "#dc2626", fontSize: "16px", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>×</button>
+                  </div>
+                  <div style={{ marginTop: "10px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                    <span style={{ fontSize: "11px", background: "#f0f4ff", color: "#2563eb", borderRadius: "6px", padding: "2px 8px", fontWeight: 500 }}>{car.interestRate.toFixed(1)}%</span>
+                    <span style={{ fontSize: "11px", background: "#f0f4ff", color: "#2563eb", borderRadius: "6px", padding: "2px 8px", fontWeight: 500 }}>{car.loanTerm}mo</span>
+                    {car.warranty > 0 && <span style={{ fontSize: "11px", background: "#f0fdf4", color: "#16a34a", borderRadius: "6px", padding: "2px 8px", fontWeight: 500 }}>Warranty</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // ── CarDetail ───────────────────────────────────────────
+    function CarDetail({ car, onChange }) {
+      const [showShare, setShowShare] = useState(false);
+      const [titleFocused, setTitleFocused] = useState(false);
+      const [notesFocused, setNotesFocused] = useState(false);
+      const d = useMemo(() => calcDerived(car), [car]);
+      const set = (field) => (val) => onChange({ ...car, [field]: val });
+      const termOptions = [24, 36, 48, 60, 72, 84];
+
+      if (!car) return (
+        <div style={{ textAlign: "center", padding: "80px 20px", color: "#bbb" }}>
+          <div style={{ fontSize: "36px", marginBottom: "12px" }}>👈</div>
+          <div style={{ fontSize: "14px" }}>Select a car from the list first.</div>
+        </div>
+      );
+
+      return (
+        <div style={{ padding: "16px" }}>
+          {showShare && <ShareModal car={car} onClose={() => setShowShare(false)} />}
+          <div className="card">
+            <input value={car.title} onChange={(e) => set("title")(e.target.value)}
+              onFocus={() => setTitleFocused(true)} onBlur={() => setTitleFocused(false)}
+              placeholder="Vehicle title..."
+              style={{ width: "100%", border: "none", borderBottom: `1.5px solid ${titleFocused ? "#2563eb" : "#e0e0e0"}`, outline: "none", background: "transparent", fontSize: "20px", fontWeight: 700, color: "#1a1a1a", padding: "4px 0", marginBottom: "12px", display: "block", fontFamily: "'DM Sans', sans-serif", transition: "border-color 0.15s" }}
+            />
+            <textarea value={car.notes} onChange={(e) => set("notes")(e.target.value)}
+              onFocus={() => setNotesFocused(true)} onBlur={() => setNotesFocused(false)}
+              placeholder="Notes — features, warranty type, color, trim..."
+              rows={3}
+              style={{ width: "100%", border: "none", borderBottom: `1.5px solid ${notesFocused ? "#2563eb" : "#e0e0e0"}`, outline: "none", background: "transparent", fontSize: "13px", color: "#555", resize: "none", lineHeight: "1.6", display: "block", fontFamily: "'DM Sans', sans-serif", transition: "border-color 0.15s", padding: "4px 0" }}
+            />
+          </div>
+
+          <div style={{ marginBottom: "16px", paddingLeft: "4px" }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "10px" }}>
+              <span style={{ fontSize: "40px", fontWeight: 700, color: "#1a1a1a", letterSpacing: "-0.03em", fontFamily: "monospace" }}>{fmtDec(d.monthly)}</span>
+              <span style={{ fontSize: "15px", color: "#999", fontWeight: 500 }}>/mo</span>
+            </div>
+            <div style={{ fontSize: "13px", color: "#aaa", marginTop: "2px" }}>Out-the-door: <strong style={{ color: "#555" }}>{fmtDec(d.outTheDoor)}</strong></div>
+          </div>
+
+          <div className="card">
+            <div style={{ fontSize: "11px", letterSpacing: "0.1em", textTransform: "uppercase", color: "#bbb", fontWeight: 600, marginBottom: "4px" }}>Cost Breakdown</div>
+            <div style={{ fontSize: "11px", color: "#ccc", marginBottom: "12px" }}>Tap any value to edit</div>
+            <EditableRow label="MSRP" value={car.msrp} onChange={set("msrp")} accent="#1a1a1a" />
+            <EditableRow label="Discount" value={car.discount} onChange={set("discount")} isNegative accent="#16a34a" />
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 0", borderBottom: "2px solid #e8e8e8" }}>
+              <span style={{ fontSize: "13px", fontWeight: 700 }}>Selling Price</span>
+              <span style={{ fontFamily: "monospace", fontSize: "14px", fontWeight: 700 }}>{fmtDec(d.sellingPrice)}</span>
+            </div>
+            <EditableRow label="Proc / Doc Fees" value={car.docFee} onChange={set("docFee")} accent="#7c3aed" />
+            <EditableRow label="State Tax" value={car.tax} onChange={set("tax")} accent="#7c3aed" />
+            <EditableRow label="Tags / Registration" value={car.tags} onChange={set("tags")} accent="#7c3aed" />
+            <EditableRow label="Extended Warranty" value={car.warranty} onChange={set("warranty")} accent="#16a34a" />
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: "12px" }}>
+              <span style={{ fontSize: "14px", fontWeight: 700 }}>Total Balance Due</span>
+              <span style={{ fontFamily: "monospace", fontSize: "16px", fontWeight: 700, color: "#2563eb" }}>{fmtDec(d.outTheDoor)}</span>
+            </div>
+          </div>
+
+          <div className="card">
+            <div style={{ fontSize: "11px", letterSpacing: "0.1em", textTransform: "uppercase", color: "#bbb", fontWeight: 600, marginBottom: "18px" }}>Financing</div>
+            <div style={{ display: "flex", gap: "12px", marginBottom: "16px" }}>
+              <NumberInput label="Down Payment" value={car.downPayment} onChange={set("downPayment")} prefix="$" />
+              <NumberInput label="Interest Rate" value={car.interestRate} onChange={set("interestRate")} suffix="%" />
+            </div>
+            <div>
+              <div style={{ fontSize: "11px", letterSpacing: "0.1em", textTransform: "uppercase", color: "#aaa", fontWeight: 500, marginBottom: "10px" }}>Loan Term</div>
+              <div style={{ display: "flex", gap: "6px" }}>
+                {termOptions.map(t => (
+                  <button key={t} className={`term-btn${car.loanTerm === t ? " active" : ""}`} onClick={() => set("loanTerm")(t)}>{t}mo</button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "10px", marginBottom: "10px" }}>
+            <div className="stat-card">
+              <div style={{ fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.1em", color: "#aaa", fontWeight: 500, marginBottom: "6px" }}>Amount Financed</div>
+              <div style={{ fontSize: "19px", fontWeight: 700, fontFamily: "monospace" }}>{fmtDec(d.financed)}</div>
+            </div>
+            <div className="stat-card">
+              <div style={{ fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.1em", color: "#aaa", fontWeight: 500, marginBottom: "6px" }}>Total Interest</div>
+              <div style={{ fontSize: "19px", fontWeight: 700, fontFamily: "monospace", color: "#dc2626" }}>{fmtDec(d.totalInterest)}</div>
+            </div>
+          </div>
+          <div style={{ background: "white", borderRadius: "14px", padding: "14px 18px", border: "1px solid #ebebeb", display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+            <span style={{ fontSize: "13px", color: "#888", fontWeight: 500 }}>Total Cost of Car</span>
+            <span style={{ fontFamily: "monospace", fontWeight: 700, fontSize: "17px" }}>{fmtDec(d.totalCost)}</span>
+          </div>
+          <button onClick={() => setShowShare(true)}
+            style={{ width: "100%", padding: "15px", borderRadius: "14px", border: "none", background: "#1a1a1a", color: "white", fontSize: "15px", fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+            ↗ Share This Deal
+          </button>
+        </div>
+      );
+    }
+
+    // ── Spreadsheet ─────────────────────────────────────────
+    function Spreadsheet({ cars, onSelect }) {
+      const cols = [
+        { key: "title",        label: "Car" },
+        { key: "msrp",         label: "MSRP",    fmt: fmt0 },
+        { key: "discount",     label: "Discount", fmt: fmt0 },
+        { key: "_selling",     label: "Selling",  fmt: fmt0 },
+        { key: "docFee",       label: "Doc Fee",  fmt: fmt0 },
+        { key: "tax",          label: "Tax",      fmt: fmt0 },
+        { key: "tags",         label: "Tags",     fmt: fmt0 },
+        { key: "warranty",     label: "Warranty", fmt: fmt0 },
+        { key: "_otd",         label: "OTD",      fmt: fmt0 },
+        { key: "downPayment",  label: "Down",     fmt: fmt0 },
+        { key: "interestRate", label: "Rate",     fmt: (v) => v.toFixed(1) + "%" },
+        { key: "loanTerm",     label: "Term",     fmt: (v) => v + "mo" },
+        { key: "_monthly",     label: "Monthly",  fmt: fmtDec },
+        { key: "_interest",    label: "Interest", fmt: fmt0 },
+        { key: "_total",       label: "Total",    fmt: fmt0 },
+      ];
+      const rows = cars.map(car => {
+        const d = calcDerived(car);
+        return { ...car, _selling: d.sellingPrice, _otd: d.outTheDoor, _monthly: d.monthly, _interest: d.totalInterest, _total: d.totalCost };
+      });
+
+      if (!cars.length) return (
+        <div style={{ textAlign: "center", padding: "80px 20px", color: "#bbb" }}>
+          <div style={{ fontSize: "40px", marginBottom: "12px" }}>📊</div>
+          <div style={{ fontSize: "14px" }}>Add cars to see them here.</div>
+        </div>
+      );
+
+      return (
+        <div style={{ overflowX: "auto", padding: "16px 0" }}>
+          <table style={{ borderCollapse: "collapse", minWidth: "100%", fontSize: "12px", fontFamily: "monospace" }}>
+            <thead>
+              <tr style={{ background: "#f5f4f0" }}>
+                {cols.map(c => (
+                  <th key={c.key} style={{ padding: "8px 12px", textAlign: "left", fontSize: "10px", textTransform: "uppercase", letterSpacing: "0.08em", color: "#999", fontWeight: 600, whiteSpace: "nowrap", borderBottom: "2px solid #e8e8e8", fontFamily: "'DM Sans', sans-serif" }}>{c.label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, i) => (
+                <tr key={row.id} onClick={() => onSelect(row.id)}
+                  style={{ background: i % 2 === 0 ? "white" : "#fafafa", cursor: "pointer" }}
+                  onMouseEnter={e => e.currentTarget.style.background = "#eff6ff"}
+                  onMouseLeave={e => e.currentTarget.style.background = i % 2 === 0 ? "white" : "#fafafa"}>
+                  {cols.map(c => (
+                    <td key={c.key} style={{ padding: "9px 12px", borderBottom: "1px solid #f0f0f0", whiteSpace: "nowrap", color: c.key === "title" ? "#1a1a1a" : "#444", fontWeight: c.key === "_monthly" || c.key === "title" ? 700 : 400 }}>
+                      {c.fmt ? c.fmt(row[c.key]) : row[c.key]}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ── App ─────────────────────────────────────────────────
+    function App() {
+      const [cars, setCars]             = useState([]);
+      const [selectedId, setSelectedId] = useState(null);
+      const [tab, setTab]               = useState(0);
+      const [loaded, setLoaded]         = useState(false);
+      const [saving, setSaving]         = useState(false);
+      const [error, setError]           = useState(null);
+
+      useEffect(() => {
+        fsGet("cars")
+          .then(data => {
+            const sorted = [...data].sort((a, b) => (a._createdAt || 0) - (b._createdAt || 0));
+            setCars(sorted);
+            if (sorted.length) setSelectedId(sorted[0].id);
+            setLoaded(true);
+          })
+          .catch(e => { setError("Firebase error: " + e.message); setLoaded(true); });
+      }, []);
+
+      const addCar = async () => {
+        const car = newCar();
+        setCars(prev => [...prev, car]);
+        setSelectedId(car.id);
+        setTab(1);
+        setSaving(true);
+        await fsPatch("cars", car.id, car).catch(e => setError(e.message));
+        setSaving(false);
+      };
+
+      const deleteCar = async (id) => {
+        setCars(prev => {
+          const upd = prev.filter(c => c.id !== id);
+          if (selectedId === id) setSelectedId(upd[0]?.id || null);
+          return upd;
+        });
+        await fsDelete("cars", id).catch(e => setError(e.message));
+      };
+
+      const updateCar = useCallback(async (updated) => {
+        setCars(prev => prev.map(c => c.id === updated.id ? updated : c));
+        setSaving(true);
+        await fsPatch("cars", updated.id, updated).catch(e => setError(e.message));
+        setSaving(false);
+      }, [selectedId]);
+
+      const selectCar = (id) => { setSelectedId(id); setTab(1); };
+
+      const exportData = () => {
+        const blob = new Blob([JSON.stringify(cars, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = "cars.json"; a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const importData = () => {
+        const input = document.createElement("input");
+        input.type = "file"; input.accept = ".json";
+        input.onchange = async (e) => {
+          const file = e.target.files[0]; if (!file) return;
+          const reader = new FileReader();
+          reader.onload = async (ev) => {
+            try {
+              const data = JSON.parse(ev.target.result);
+              if (!Array.isArray(data)) throw new Error("Expected an array");
+              setCars(data);
+              if (data.length) setSelectedId(data[0].id);
+              setTab(0);
+              setSaving(true);
+              await Promise.all(data.map(car => fsPatch("cars", car.id, car))).catch(e => setError(e.message));
+              setSaving(false);
+            } catch (err) { setError("Import failed: " + err.message); }
+          };
+          reader.readAsText(file);
+        };
+        input.click();
+      };
+
+      const selectedCar = cars.find(c => c.id === selectedId) || null;
+
+      if (!loaded) return (
+        <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#f5f4f0", color: "#aaa", fontFamily: "'DM Sans', sans-serif", gap: "12px" }}>
+          <div style={{ fontSize: "32px" }}>🔥</div>
+          <div style={{ fontSize: "14px" }}>Connecting to Firebase…</div>
+        </div>
+      );
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#f5f4f0", display: "flex", flexDirection: "column", maxWidth: "600px", margin: "0 auto" }}>
+          {/* Header */}
+          <div style={{ padding: "16px 16px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <span style={{ fontSize: "16px", fontWeight: 700, color: "#1a1a1a" }}>Car Comparator</span>
+              <span style={{ marginLeft: "8px", fontSize: "11px", color: saving ? "#f59e0b" : "#16a34a", fontWeight: 600 }}>
+                {saving ? "● saving…" : "● Firebase"}
+              </span>
+            </div>
+            <div style={{ display: "flex", gap: "8px" }}>
+              <button onClick={importData} style={{ background: "white", border: "1.5px solid #e0e0e0", borderRadius: "8px", padding: "6px 12px", fontSize: "12px", fontWeight: 600, cursor: "pointer", color: "#555" }}>↓ Import</button>
+              <button onClick={exportData} style={{ background: "white", border: "1.5px solid #e0e0e0", borderRadius: "8px", padding: "6px 12px", fontSize: "12px", fontWeight: 600, cursor: "pointer", color: "#555" }}>↑ Export</button>
+            </div>
+          </div>
+
+          {error && (
+            <div style={{ margin: "10px 16px 0", background: "#fee2e2", border: "1px solid #fca5a5", borderRadius: "10px", padding: "10px 14px", fontSize: "12px", color: "#dc2626", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>⚠ {error}</span>
+              <span onClick={() => setError(null)} style={{ cursor: "pointer", fontWeight: 700, marginLeft: "12px" }}>×</span>
+            </div>
+          )}
+
+          {/* Tabs */}
+          <div style={{ display: "flex", gap: "6px", padding: "12px 16px", position: "sticky", top: 0, background: "#f5f4f0", zIndex: 10 }}>
+            {["🚗 Cars", "📋 Detail", "📊 Sheet"].map((label, i) => (
+              <button key={i} onClick={() => setTab(i)}
+                style={{ flex: 1, padding: "10px 0", borderRadius: "12px", border: "none", background: tab === i ? "#1a1a1a" : "white", color: tab === i ? "white" : "#666", fontSize: "13px", fontWeight: 600, cursor: "pointer", transition: "all 0.15s", boxShadow: tab === i ? "none" : "0 1px 4px rgba(0,0,0,0.06)" }}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ flex: 1, overflowY: tab === 2 ? "hidden" : "auto" }}>
+            {tab === 0 && <CarsList cars={cars} selectedId={selectedId} onSelect={selectCar} onAdd={addCar} onDelete={deleteCar} />}
+            {tab === 1 && <CarDetail car={selectedCar} onChange={updateCar} />}
+            {tab === 2 && <Spreadsheet cars={cars} onSelect={selectCar} />}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
